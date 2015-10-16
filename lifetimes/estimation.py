@@ -4,7 +4,7 @@ from collections import OrderedDict
 import numpy as np
 from numpy import log, exp, logaddexp, asarray, any as npany, c_ as vconcat,\
                   isinf, isnan, ones_like
-from pandas import DataFrame
+from pandas import DataFrame, ols
 
 from scipy import special
 from scipy import misc
@@ -59,6 +59,64 @@ class GammaGammaFitter(BaseFitter):
 
         return negative_log_likelihood
 
+    def _r(self, row):
+        if row['x'] == 0 and row['t'] == 0:
+            return 0
+
+        p = self._unload_params('p')[0]
+
+        r = dict()
+        r['log_dev_m'] = np.log(row['m']) - np.log(row['em'])  # log deviation of m on em
+        r['log_dev_x'] = np.log(row['x']) - np.log(row['ex'])  # log deviation of x on ex
+
+        r['x0'] = [r['log_dev_x']]
+        r['x1'] = [p * r['log_dev_x']]
+        r['x2'] = [row['T'] * r['log_dev_x']]
+        r['x3'] = [row['t'] * r['log_dev_x']]
+
+        r['log_dev_m'] = [r['log_dev_m']]
+
+        df = DataFrame(r)
+        a0, a1, a2, a3 = ols(y=df['log_dev_m'], x=df[['x0', 'x1', 'x2', 'x3']], intercept=False).beta
+        return a1 * p + a2 * row['T'] + a3 * row['t'] + a0*1.0
+
+    def compute_m(self, frequency, recency, T, monetary_value, pareto_fitted_model, k):
+        df = DataFrame()
+        df['x'] = frequency
+        df['t'] = recency
+        df['T'] = T
+        df['m'] = monetary_value
+
+        df['ex'] = df.apply(
+            lambda r: pareto_fitted_model.expected_number_of_purchases_up_to_time(
+                1,
+            ),
+            axis=1
+        )
+        df['ex_tk'] = df.apply(
+            lambda r: pareto_fitted_model.expected_number_of_purchases_up_to_time(
+                k,
+            ),
+            axis=1
+        )
+
+        df['x_tk'] = df.apply(
+            lambda r: pareto_fitted_model.conditional_expected_number_of_purchases_up_to_time(
+                k,
+                r['x'],
+                r['t'],
+                r['T']
+            ),
+            axis=1
+        )
+
+        df['em'] = self.conditional_expected_average_profit()
+        df['r'] = df.apply(self._r, axis=1)
+
+        df['m_tk'] = df['m'] * (df['x_tk']/df['ex_tk']/df['x']/df['ex'])**df['r']
+
+        return df
+
     def conditional_expected_average_profit(self, frequency=None, monetary_value=None):
         """
         This method computes the conditional expectation of the average profit per transaction
@@ -75,6 +133,7 @@ class GammaGammaFitter(BaseFitter):
         x = self.data['frequency'] if frequency is None else frequency
         p, q, v = self._unload_params('p', 'q', 'v')
         return np.mean((((q - 1) / (p * x + q - 1)) * (v * p / (q - 1))) + (p * x / (p * x + q - 1)) * m)
+
 
     def customer_lifetime_value(self, transaction_prediction_model, frequency, recency, T, monetary_value, time=12, discount_rate=1):
         """
@@ -96,19 +155,20 @@ class GammaGammaFitter(BaseFitter):
         df['frequency'] = frequency
         df['recency'] = recency
         df['T'] = T
+        df['m_tk'] = monetary_value
 
         d = discount_rate
-        m = self.conditional_expected_average_profit()
+        # m = self.conditional_expected_average_profit()
         discounted_monthly_cash_flows = []
 
         for i in range(30, (time*30)+1, 30):
             df['expected_revenues_period_'+str(i)] = df.apply(
-                lambda r: (m*transaction_prediction_model.predict(i, r['frequency'], r['recency'], r['T'])/(1+d)**(i/30)),
+                lambda r: (r['m_tk']*transaction_prediction_model.predict(i, r['frequency'], r['recency'], r['T'])/(1+d)**(i/30)),
                 axis=1
             )
             discounted_monthly_cash_flows.append(df['expected_revenues_period_'+str(i)].sum())
 
-        return sum(discounted_monthly_cash_flows)
+        return monetary_value.sum() + sum(discounted_monthly_cash_flows)
 
 
     def fit(self, frequency, monetary_value, iterative_fitting=5, initial_params=None, verbose=False):
@@ -254,7 +314,7 @@ class ParetoNBDFitter(BaseFitter):
 
     def conditional_expected_number_of_purchases_up_to_time(self, t, frequency, recency, T):
         """
-        Calculate the expected number of repeat purchases up to time t for a randomly choose individual from
+        Calculate the expected number of repeat purchases up to time t for a randomly chosen individual from
         the population, given they have purchase history (frequency, recency, T)
 
         Parameters:
@@ -277,7 +337,7 @@ class ParetoNBDFitter(BaseFitter):
 
     def expected_number_of_purchases_up_to_time(self, t):
         """
-        Calculate the expected number of repeat purchases up to time t for a randomly choose individual from
+        Calculate the expected number of repeat purchases up to time t for a randomly chosen individual from
         the population.
 
         Parameters:
